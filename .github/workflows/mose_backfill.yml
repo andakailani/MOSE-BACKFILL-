@@ -1,17 +1,25 @@
-name: XAUUSD Backfill 2013-2023 (independent project)
+name: XAUUSD Backfill 2013-2023 (independent, belum ke MOSE)
 
 # SCOPE PROJECT INI (baca dulu sebelum run):
 #  - Kumpul + validasi + simpan Parquet tick XAUUSD 2013-2023 SAJA.
-#  - Ditulis ke folder Drive independen (bukan folder MOSE).
+#  - Ditulis ke bucket Backblaze B2 independen (bukan folder MOSE, bukan Drive).
 #  - TIDAK melakukan feature engineering / state / event / konsolidasi MOSE.
 #    Itu langkah manual terpisah, dilakukan sadar setelah data ini dicek.
+#
+# PERUBAHAN vs versi Google Drive:
+#  - Storage backend: Backblaze B2 (bukan Drive), autentikasi key statis
+#    (tidak ada OAuth/service-account-quota seperti masalah sebelumnya).
+#  - max-parallel dibatasi supaya tidak menghantam histdata.com / B2 API
+#    dengan 12 job bersamaan (risiko rate-limit / anti-bot).
+#  - Retry ditambahkan di step upload, karena kegagalan jaringan sesaat
+#    tidak seharusnya menggagalkan seluruh bulan.
 #
 # Cara pakai:
 #  1. Uji 1 bulan dulu: Actions tab -> Run workflow -> year=2015, months="6"
 #  2. Kalau sukses & tervalidasi manual, jalankan per tahun: months="1,2,...,12"
 #  3. Ulangi untuk tiap tahun di rentang 2013-2023
 #  4. Job "validate_year" jalan otomatis setelah semua bulan di run itu selesai,
-#     mengecek 12 bulan lengkap (mirip assertion §3.6 MOSE Notebook 01)
+#     mengecek 12 bulan lengkap DAN membaca manifest per-bulan (row count, NaT)
 
 on:
   workflow_dispatch:
@@ -26,12 +34,17 @@ on:
         default: "1,2,3,4,5,6,7,8,9,10,11,12"
         type: string
 
+env:
+  B2_BUCKET: xauusd-backfill-andakailani-2013-2023
+  B2_BASE_PATH: 01_parquet
+
 jobs:
   ingest:
     runs-on: ubuntu-latest
     timeout-minutes: 340
     strategy:
       fail-fast: false
+      max-parallel: 3   # <-- penting: batasi paralelisme ke histdata.com & B2
       matrix:
         month: ${{ fromJSON(format('[{0}]', github.event.inputs.months)) }}
     steps:
@@ -40,9 +53,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
-        run: pip install -r scripts/requirements.txt
+        run: pip install -r scripts/requirements.txt --break-system-packages || pip install -r scripts/requirements.txt
 
       - name: Ingest bulan ${{ matrix.month }}/${{ github.event.inputs.year }}
         working-directory: scripts
@@ -52,28 +66,46 @@ jobs:
       - name: Install rclone
         run: curl https://rclone.org/install.sh | sudo bash
 
-      - name: Setup kredensial Google Drive dari secret
+      - name: Setup kredensial Backblaze B2
         run: |
           mkdir -p ~/.config/rclone
-          echo '${{ secrets.GDRIVE_SA_JSON }}' > /tmp/gdrive_sa.json
           cat > ~/.config/rclone/rclone.conf <<'EOF'
-          [gdrive]
-          type = drive
-          scope = drive
-          service_account_file = /tmp/gdrive_sa.json
+          [b2remote]
+          type = b2
+          account = ${{ secrets.B2_KEY_ID }}
+          key = ${{ secrets.B2_APPLICATION_KEY }}
           EOF
 
-      - name: Upload ke folder independen (BUKAN folder MOSE)
+      - name: Upload parquet ke B2 (dengan retry)
         run: |
-          rclone copy /tmp/mose_out/01_parquet \
-            "gdrive:XAUUSD_Backfill_2013_2023/data/01_parquet" \
-            --create-empty-src-dirs -v
+          for attempt in 1 2 3; do
+            echo "Percobaan upload ke-$attempt ..."
+            if rclone copy /tmp/mose_out/01_parquet \
+                "b2remote:${{ env.B2_BUCKET }}/${{ env.B2_BASE_PATH }}" \
+                --create-empty-src-dirs -v --retries 3 --low-level-retries 10; then
+              echo "Upload sukses."
+              exit 0
+            fi
+            echo "Upload gagal, tunggu 15 detik sebelum coba lagi..."
+            sleep 15
+          done
+          echo "::error::Upload ke B2 gagal setelah 3x percobaan."
+          exit 1
 
       - name: Upload rejected rows (kalau ada) untuk audit
+        if: always()
         run: |
           if [ -d /tmp/mose_temp/rejected_rows ]; then
             rclone copy /tmp/mose_temp/rejected_rows \
-              "gdrive:XAUUSD_Backfill_2013_2023/data/metadata/rejected_rows" -v
+              "b2remote:${{ env.B2_BUCKET }}/metadata/rejected_rows" -v
+          fi
+
+      - name: Upload manifest bulan ini
+        if: always()
+        run: |
+          if [ -d /tmp/mose_temp/manifest ]; then
+            rclone copy /tmp/mose_temp/manifest \
+              "b2remote:${{ env.B2_BUCKET }}/metadata/manifest" -v
           fi
 
   validate_year:
@@ -84,246 +116,44 @@ jobs:
       - name: Install rclone
         run: curl https://rclone.org/install.sh | sudo bash
 
-      - name: Setup kredensial Google Drive dari secret
+      - name: Setup kredensial Backblaze B2
         run: |
           mkdir -p ~/.config/rclone
-          echo '${{ secrets.GDRIVE_SA_JSON }}' > /tmp/gdrive_sa.json
           cat > ~/.config/rclone/rclone.conf <<'EOF'
-          [gdrive]
-          type = drive
-          scope = drive
-          service_account_file = /tmp/gdrive_sa.json
+          [b2remote]
+          type = b2
+          account = ${{ secrets.B2_KEY_ID }}
+          key = ${{ secrets.B2_APPLICATION_KEY }}
           EOF
 
-      - name: Cek kelengkapan bulan untuk tahun ${{ github.event.inputs.year }}
+      - name: Cek kelengkapan bulan (folder) untuk tahun ${{ github.event.inputs.year }}
         run: |
           YEAR=${{ github.event.inputs.year }}
           echo "Mengecek partisi tick untuk year=$YEAR ..."
-          FOUND=$(rclone lsf "gdrive:XAUUSD_Backfill_2013_2023/data/01_parquet/tick/year=$YEAR" 2>/dev/null | grep -c "^month=" || true)
-          echo "Bulan ditemukan: $FOUND / 12"
+          FOUND=$(rclone lsf "b2remote:${{ env.B2_BUCKET }}/${{ env.B2_BASE_PATH }}/tick/year=$YEAR" 2>/dev/null | grep -c "^month=" || true)
+          echo "Bulan ditemukan (folder ada): $FOUND / 12"
           if [ "$FOUND" -lt 12 ]; then
-            echo "::warning::Tahun $YEAR BELUM lengkap 12 bulan (baru $FOUND). Jangan dipakai untuk konsolidasi ke MOSE dulu."
-          else
-            echo "Tahun $YEAR lengkap 12 bulan. Aman untuk tahap review manual berikutnya."
+            echo "::warning::Tahun $YEAR BELUM lengkap 12 bulan folder (baru $FOUND)."
           fi
 
-"""
-CONFIG untuk MOSE backfill multi-tahun.
-
-Basis: CONFIG dict di MOSE Notebook 01 (§3.3 dokumen laporan final).
-PERUBAHAN PENTING vs versi 2024-only — lihat catatan PRICE_MIN/PRICE_MAX di
-bawah. Ini BUKAN penyesuaian kosmetik, ini perbaikan bug laten yang baru
-kelihatan begitu kamu keluar dari data 2024.
-"""
-
-CONFIG = {
-    "PRICE_DIVISOR": 100000,          # histdata raw price / divisor = harga desimal asli
-    "DT_FORMAT_RAW": "%Y%m%d %H%M%S%f",
-    "CHUNK_SIZE": 500_000,            # baris per chunk saat streaming read
-
-    # ------------------------------------------------------------------
-    # PENTING — PRICE_MIN/PRICE_MAX di dokumen asli (1500.0 / 4000.0)
-    # dikalibrasi HANYA untuk data 2024, di mana harga gold memang di
-    # rentang itu. Begitu kamu ingest tahun 2004-2019, harga gold pernah
-    # serendah ~US$250 (2001) dan ~US$1050 (2015-2016). Kalau bound lama
-    # dipakai, chunk-chunk itu akan ditolak validate_chunk() bukan
-    # sebagai outlier, tapi sebagai "data rusak" — padahal valid.
-    #
-    # Ini filter garbage-data (harga negatif, nol, angka rusak feed),
-    # BUKAN filter outlier ekonomi — outlier ekonomi tetap ditangani
-    # terpisah oleh global z-score pass (§3.5), yang MELABELI, bukan
-    # membuang. Jadi aman untuk dilebarkan jauh di sini.
-    # ------------------------------------------------------------------
-    "PRICE_MIN": 200.0,
-    "PRICE_MAX": 4000.0,
-
-    "OUTLIER_SIGMA": 5.0,             # dihitung per-tahun di stage ini;
-                                       # konsolidasi lintas-tahun ada di
-                                       # scripts/consolidate_outliers.py
-    "MAX_SPREAD": 5.0,                # sedikit dilonggarkan dari 3.0 — spread
-                                       # bisa lebih lebar di era likuiditas
-                                       # lebih rendah (pra-2010). Tinjau ulang
-                                       # setelah lihat distribusi aktual.
-    "MIN_SPREAD": 0.05,
-    "SMOOTH_WINDOW": 3,
-    "GAP_THRESHOLD_MIN": 60,
-
-    "TIMEFRAMES": {
-        "M1": "1min", "M5": "5min", "M15": "15min",
-        "H1": "1h", "H4": "4h", "D1": "1D",
-    },
-
-    "PAIR": "xauusd",
-    # PENTING — sengaja TERPISAH dari folder MOSE di akun Drive lain.
-    # Project ini independen: kumpulkan + validasi 2013-2023 dulu di sini,
-    # konsolidasi ke MOSE/ (akun nawibarrak) dilakukan manual belakangan,
-    # sebagai keputusan sadar, bukan otomatis.
-    "DRIVE_BASE": "XAUUSD_Backfill_2013_2023/data",
-    "TARGET_YEARS": list(range(2013, 2024)),  # 2013..2023 inklusif
-}
-
-"""
-Ingest satu bulan data XAUUSD dari histdata.com, proses jadi parquet,
-simpan lokal di runner (nanti di-upload ke Drive oleh workflow).
-
-Dipanggil per-bulan (bukan per-tahun) supaya:
-  1. Muat dalam batas waktu 1 job GitHub Actions (~6 jam, tapi harusnya
-     jauh lebih cepat dari itu per bulan).
-  2. Kalau 1 bulan gagal, tidak perlu ulang 1 tahun penuh.
-  3. Selaras dengan struktur partisi zero-padded yang sudah kamu pakai
-     (year=YYYY/month=MM).
-
-CATATAN JUJUR — belum diuji end-to-end (sandbox development ini tidak
-punya akses jaringan). Sebelum full backfill 10 tahun, WAJIB jalankan
-dulu untuk 1 bulan lewat workflow_dispatch dan cek hasilnya manual.
-Kemungkinan yang perlu disesuaikan:
-  - Nama instrumen di package `histdata` untuk XAUUSD (kadang perlu
-    dicoba 'xauusd' vs kode lain tergantung update situs).
-  - histdata.com kadang menaruh proteksi anti-bot tambahan yang bikin
-    package butuh update. Kalau gagal, Dukascopy (lewat `duka` atau
-    `dukascopy-node`) adalah fallback yang sudah disiapkan strukturnya
-    di download_source() di bawah.
-"""
-
-import argparse
-import io
-import sys
-import zipfile
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
-
-from config import CONFIG
-
-RAW_TEMP_DIR = Path("/tmp/mose_temp/raw_incoming")
-REJECTED_DIR = Path("/tmp/mose_temp/rejected_rows")
-OUT_DIR = Path("/tmp/mose_out")
-
-
-def download_source(year: int, month: int) -> Path:
-    """
-    Unduh 1 bulan tick data XAUUSD dari histdata.com.
-    Return path ke file CSV mentah (sudah diekstrak dari ZIP).
-
-    Primary: package `histdata` (pip install histdata).
-    Fallback manual kalau package gagal / instrumen tidak ketemu:
-    unduh ZIP langsung dari URL histdata.com generic ASCII tick data
-    dan proses sama seperti biasa.
-    """
-    RAW_TEMP_DIR.mkdir(parents=True, exist_ok=True)
-
-    try:
-        from histdata import download_hist_data as dl
-        from histdata.api import Platform as P, TimeFrame as TF
-
-        zip_path = dl(
-            year=str(year),
-            month=str(month),
-            pair=CONFIG["PAIR"],
-            platform=P.GENERIC_ASCII,
-            time_frame=TF.TICK_DATA,
-            output_directory=str(RAW_TEMP_DIR),
-        )
-        return Path(zip_path)
-    except Exception as e:  # noqa: BLE001 — sengaja luas, ini fallback path
-        print(f"[WARN] package histdata gagal ({e}); coba fallback manual", file=sys.stderr)
-        raise NotImplementedError(
-            "Fallback manual histdata.com / Dukascopy belum diisi — "
-            "isi di sini setelah uji coba 1 bulan menunjukkan package utama gagal."
-        )
-
-
-def parse_tick_csv(zip_path: Path) -> pd.DataFrame:
-    """Baca ZIP histdata, kembalikan DataFrame tick mentah."""
-    with zipfile.ZipFile(zip_path) as zf:
-        csv_name = [n for n in zf.namelist() if n.lower().endswith(".csv")][0]
-        with zf.open(csv_name) as f:
-            df = pd.read_csv(
-                f,
-                sep=",",
-                header=None,
-                names=["dt_raw", "bid", "ask", "vol"],
-                dtype={"dt_raw": str},
-            )
-    return df
-
-
-def validate_chunk(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Filter sesuai §3.4 step 2. Return (valid, rejected)."""
-    df = df.copy()
-    df["timestamp"] = pd.to_datetime(
-        df["dt_raw"], format=CONFIG["DT_FORMAT_RAW"], errors="coerce"
-    )
-    df["mid"] = (df["bid"] + df["ask"]) / 2
-    df["spread"] = df["ask"] - df["bid"]
-
-    mask_valid = (
-        df["timestamp"].notna()
-        & df["mid"].between(CONFIG["PRICE_MIN"], CONFIG["PRICE_MAX"])
-        & df["spread"].between(CONFIG["MIN_SPREAD"], CONFIG["MAX_SPREAD"])
-    )
-    return df[mask_valid].copy(), df[~mask_valid].copy()
-
-
-def clean_chunk(df: pd.DataFrame) -> pd.DataFrame:
-    """§3.4 step 3: dedup, smoothing, kolom turunan."""
-    df = df.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
-    df["mid_smooth"] = df["mid"].ewm(span=CONFIG["SMOOTH_WINDOW"]).mean()
-    df["hour"] = df["timestamp"].dt.hour
-    df["year"] = df["timestamp"].dt.year
-    df["month"] = df["timestamp"].dt.month
-    df["spread_pips"] = df["spread"] / 0.10
-    return df
-
-
-def write_partition(df: pd.DataFrame, year: int, month: int) -> Path:
-    out_path = OUT_DIR / "01_parquet" / "tick" / f"year={year:04d}" / f"month={month:02d}"
-    out_path.mkdir(parents=True, exist_ok=True)
-    file_path = out_path / "part-0000.parquet"
-    df.to_parquet(file_path, index=False)
-    return file_path
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--year", type=int, required=True)
-    ap.add_argument("--month", type=int, required=True)
-    args = ap.parse_args()
-
-    print(f"[INFO] Ingest XAUUSD {args.year}-{args.month:02d}")
-    zip_path = download_source(args.year, args.month)
-    raw = parse_tick_csv(zip_path)
-    valid, rejected = validate_chunk(raw)
-    clean = clean_chunk(valid)
-
-    REJECTED_DIR.mkdir(parents=True, exist_ok=True)
-    if len(rejected):
-        rejected.to_parquet(
-            REJECTED_DIR / f"rejected_{args.year}{args.month:02d}.parquet", index=False
-        )
-
-    out_file = write_partition(clean, args.year, args.month)
-
-    nat_count = int(raw["dt_raw"].isna().sum())
-    print(
-        f"[OK] {len(clean):,} baris bersih | {len(rejected):,} ditolak | "
-        f"NaT={nat_count} | output={out_file}"
-    )
-
-    # exit non-zero kalau kosong total — supaya job GitHub Actions gagal
-    # dengan jelas, bukan diam-diam sukses tanpa data
-    if len(clean) == 0:
-        print("[FAIL] Tidak ada baris valid untuk bulan ini.", file=sys.stderr)
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
-
-pandas>=2.0
-numpy>=1.24
-pyarrow>=14.0
-histdata @ git+https://github.com/philipperemy/FX-1-Minute-Data.git
-
-
+      - name: Cek isi manifest (row count & NaT) untuk tahun ${{ github.event.inputs.year }}
+        run: |
+          YEAR=${{ github.event.inputs.year }}
+          mkdir -p /tmp/manifest_check
+          rclone copy "b2remote:${{ env.B2_BUCKET }}/metadata/manifest" /tmp/manifest_check -v || true
+          BAD=0
+          for f in /tmp/manifest_check/manifest_${YEAR}*.json; do
+            [ -e "$f" ] || continue
+            ROWS=$(python3 -c "import json;print(json.load(open('$f'))['clean_rows'])" 2>/dev/null || echo 0)
+            NAT=$(python3 -c "import json;print(json.load(open('$f'))['nat_count'])" 2>/dev/null || echo -1)
+            echo "$f -> clean_rows=$ROWS nat_count=$NAT"
+            if [ "$ROWS" -le 0 ] || [ "$NAT" != "0" ]; then
+              echo "::warning::$f mencurigakan (rows=$ROWS, nat=$NAT)"
+              BAD=1
+            fi
+          done
+          if [ "$BAD" -eq 1 ]; then
+            echo "::warning::Tahun $YEAR punya bulan dengan manifest mencurigakan. JANGAN dipakai untuk konsolidasi ke MOSE sebelum dicek manual."
+          else
+            echo "Semua manifest yang ditemukan untuk tahun $YEAR terlihat wajar."
+          fi
